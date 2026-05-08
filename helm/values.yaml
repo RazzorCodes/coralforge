@@ -1,0 +1,86 @@
+replicaCount: 1
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  repository: zot.lan/homereef-coralforge
+  tag: latest
+  pullPolicy: Always
+
+imagePullSecrets: []
+
+service:
+  type: ClusterIP
+  port: 5000
+  annotations: {}
+
+containerPort: 5000
+
+brinecrypt:
+  url: ""
+  audience: "brinekey"
+
+github:
+  repo: ""
+
+brinekey:
+  githubRemotePath: ""       # brinecrypt resource path for the GitHub PAT
+  targetSecret: "coralforge-github-token"
+  secretKey: "github_token"
+  refreshInterval: "1h"
+
+ingress:
+  enabled: true
+  className: ""
+  annotations: {}
+  hosts:
+    - host: coralforge.lan
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+readinessProbe:
+  enabled: true
+  path: /healthz
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 6
+  successThreshold: 1
+
+livenessProbe:
+  enabled: true
+  path: /healthz
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  timeoutSeconds: 2
+  failureThreshold: 5
+  successThreshold: 1
+
+podAnnotations: {}
+deploymentAnnotations: {}
+podSecurityContext: {}
+securityContext: {}
+
+env: []
+envFrom: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations:
+    brinecrypt.io/access: "ci:read,write,coralforge:read,write"

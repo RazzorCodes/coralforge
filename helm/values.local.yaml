@@ -1,0 +1,8 @@
+brinecrypt:
+  url: "http://brinecrypt.kube-ex.svc.cluster.local:8080"
+
+github:
+  repo: "RazzorCodes/brinecrypt"
+
+brinekey:
+  githubRemotePath: "github/coralforge-brinecrypt-repo-contents-rw-pat"

@@ -1,0 +1,21 @@
+# Corrected repository configuration for Coralforge
+# This YAML is intended to be loaded into a ConfigMap and processed by Coralforge.
+
+repos:
+  brinecrypt:
+    friendly-name: "brinecrypt"
+    owner:
+      type: "brinecrypt-secret"
+      namespace: "coralforge"
+      name: "repo-brinecrypt-owner"
+      key: "value"
+    token:
+      type: "brinecrypt-secret"
+      namespace: "github"
+      name: "coralforge-brinecrypt-pat"
+      key: "github_token"
+    repo:
+      type: "brinecrypt-secret"
+      namespace: "coralforge"
+      name: "repo-brinecrypt-name"
+      key: "value"
