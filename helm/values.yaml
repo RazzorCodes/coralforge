@@ -75,6 +75,18 @@ securityContext: {}
 env: []
 envFrom: []
 
+# List of repos Coralforge should manage.
+# For each entry, Coralforge fetches .coralforge.yml from GitHub API at startup.
+# Example:
+#   repos:
+#     - owner: RazzorCodes
+#       repo: bm25
+#       tokenSecretRef:
+#         namespace: github
+#         name: coralforge-bm25-pat
+#         key: github_token
+repos: []
+
 nodeSelector: {}
 tolerations: []
 affinity: {}
@@ -83,4 +95,4 @@ serviceAccount:
   create: true
   name: ""
   annotations:
-    brinecrypt.io/access: "ci:read,write,coralforge:read,write"
+    brinecrypt.io/access: "ci:read,write,coralforge:read,write,github:read,drone:read"

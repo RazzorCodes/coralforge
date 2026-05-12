@@ -1,0 +1,83 @@
+version: 1
+repo:
+  name: bm25lib
+  owner: RazzorCodes
+  repo: bm25lib
+  workspace_path: /home/andrei/git/dev/bm25lib
+providers:
+  github:
+    kind: github-actions
+    repo:
+      owner: RazzorCodes
+      repo: bm25lib
+    auth:
+      token:
+        secretRef:
+          namespace: coralforge
+          name: bm25lib-github
+          key: token
+  drone:
+    kind: drone
+    endpoint: https://drone.example.internal
+    repo:
+      owner: RazzorCodes
+      repo: bm25lib
+    auth:
+      token:
+        secretRef:
+          namespace: coralforge
+          name: bm25lib-drone
+          key: token
+secrets:
+  pypi_token:
+    secretRef:
+      namespace: coralforge
+      name: bm25lib-pypi
+      key: token
+run_types:
+  ci:
+    default_provider: drone
+    provider_target:
+      pipeline: bm25-ci
+    trigger:
+      mode: automatic
+      branches:
+        - main
+        - release/*
+    stages:
+      - name: configure
+        provider: drone
+        mode: automatic
+        target:
+          pipeline: bm25-ci
+          step: configure
+        runner: docker
+      - name: build
+        provider: drone
+        mode: automatic
+        target:
+          pipeline: bm25-ci
+          step: build
+        runner: docker
+        depends_on:
+          - configure
+      - name: test
+        provider: drone
+        mode: automatic
+        target:
+          pipeline: bm25-ci
+          step: test
+        runner: docker
+        depends_on:
+          - build
+      - name: lint
+        provider: drone
+        mode: automatic
+        target:
+          pipeline: bm25-ci
+          step: lint
+        runner: docker
+        depends_on:
+          - build
+metadata:
+  default_ref: main

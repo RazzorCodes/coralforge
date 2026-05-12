@@ -6,3 +6,17 @@ github:
 
 brinekey:
   githubRemotePath: "github/coralforge-brinecrypt-repo-contents-rw-pat"
+
+repos:
+  - owner: RazzorCodes
+    repo: brinecrypt
+    tokenSecretRef:
+      namespace: github
+      name: coralforge-brinecrypt-repo-contents-rw-pat
+      key: github_token
+  - owner: RazzorCodes
+    repo: bm25lib
+    tokenSecretRef:
+      namespace: github
+      name: coralforge-bm25-pat
+      key: github_token

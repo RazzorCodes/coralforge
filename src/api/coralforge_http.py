@@ -1,10 +1,6 @@
-"""HTTP API blueprint for coralforge.
+"""HTTP API for normalized Coralforge CI orchestration."""
 
-Thin layer: validates input, calls AppCore, returns JSON responses.
-Designed so core can be reused by gRPC, jackfield connector, etc.
-
-See the design doc in this file's header comment for the full API spec.
-"""
+from __future__ import annotations
 
 import logging
 from typing import Optional
@@ -16,25 +12,19 @@ from src.core.app_core import AppCore
 logger = logging.getLogger("coralforge.api")
 
 api = Blueprint("api", __name__, url_prefix="/api/v1")
-
-# Assigned at blueprint registration time by app.py
 _core: Optional[AppCore] = None
 
 
 def init_core(core: AppCore) -> None:
-    """Inject the AppCore instance into this blueprint."""
     global _core
     _core = core
 
 
-# ── Helpers ────────────────────────────────────────────────────────
-
 def _require_core():
     if _core is None:
         return jsonify({"error": "core not initialized"}), 503
+    return None
 
-
-# ── Health ─────────────────────────────────────────────────────────
 
 @api.route("/healthz")
 def healthz():
@@ -44,7 +34,103 @@ def healthz():
     return jsonify(_core.health())
 
 
-# ── Repo queries ───────────────────────────────────────────────────
+@api.route("/repos", methods=["GET"])
+def list_repos():
+    core_err = _require_core()
+    if core_err:
+        return core_err
+    return jsonify({"repos": _core.list_repo_definitions()})
+
+
+@api.route("/runs", methods=["GET"])
+def list_runs():
+    core_err = _require_core()
+    if core_err:
+        return core_err
+
+    target = request.args.get("target")
+    run_type = request.args.get("run_type")
+    limit = int(request.args.get("limit", "20"))
+    refresh = request.args.get("refresh") == "1"
+
+    runs = _core.list_runs(target, run_type, limit)
+    if refresh:
+        hydrated = []
+        for run in runs:
+            hydrated.append(_core.get_run(run["run_id"], refresh=True) or run)
+        runs = hydrated
+    return jsonify({"runs": runs})
+
+
+@api.route("/runs", methods=["POST"])
+def trigger_run():
+    core_err = _require_core()
+    if core_err:
+        return core_err
+
+    payload = request.get_json(silent=True) or {}
+    target = payload.get("target") or request.args.get("target")
+    run_type = payload.get("run_type") or request.args.get("run_type")
+    ref = payload.get("ref") or request.args.get("ref")
+    actor = payload.get("actor") or request.headers.get("X-Coralforge-Actor", "api")
+    provider = payload.get("provider") or request.args.get("provider")
+    inputs = payload.get("inputs")
+
+    if not target or not run_type:
+        return jsonify({"error": "target and run_type are required"}), 400
+
+    try:
+        run = _core.trigger_run(
+            repo_name=target,
+            run_type=run_type,
+            ref=ref,
+            actor=actor,
+            provider_name=provider,
+            inputs=inputs,
+        )
+    except KeyError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        logger.exception("trigger_run failed")
+        return jsonify({"error": str(exc)}), 409
+    return jsonify(run), 202
+
+
+@api.route("/runs/<run_id>", methods=["GET"])
+def get_run(run_id: str):
+    core_err = _require_core()
+    if core_err:
+        return core_err
+
+    run = _core.get_run(run_id, refresh=request.args.get("refresh") == "1")
+    if run is None:
+        return jsonify({"error": "run not found"}), 404
+    return jsonify(run)
+
+
+@api.route("/runs/<run_id>/logs", methods=["GET"])
+def get_logs(run_id: str):
+    core_err = _require_core()
+    if core_err:
+        return core_err
+
+    logs = _core.get_logs(run_id, refresh=request.args.get("refresh") == "1")
+    if logs is None:
+        return jsonify({"error": "run not found"}), 404
+    return jsonify(logs)
+
+
+@api.route("/runs/<run_id>/provider", methods=["GET"])
+def get_provider(run_id: str):
+    core_err = _require_core()
+    if core_err:
+        return core_err
+
+    payload = _core.get_provider_metadata(run_id)
+    if payload is None:
+        return jsonify({"error": "run not found"}), 404
+    return jsonify(payload)
+
 
 @api.route("/repo")
 def repo_query():
@@ -53,25 +139,18 @@ def repo_query():
         return core_err
 
     op = request.args.get("op", "list")
+    target = request.args.get("target")
 
     if op == "list":
-        repos = _core.list_repos()
-        return jsonify({"repos": repos})
-
+        return jsonify({"repos": _core.list_repo_definitions()})
     if op == "query":
-        target = request.args.get("target")
-        statuses = _core.get_status(target)
-        return jsonify({"repos": statuses})
-
+        return jsonify({"repos": _core.get_status(target)})
     if op == "stable":
-        target = request.args.get("target")
-        stables = _core.get_stable(target)
-        return jsonify({"stables": stables})
-
+        return jsonify({"stables": _core.get_stable(target)})
+    if op == "all":
+        return jsonify({"repos": _core.get_all_versions(target)})
     return jsonify({"error": f"unknown op: {op}"}), 400
 
-
-# ── Mutations ──────────────────────────────────────────────────────
 
 @api.route("/trigger-release", methods=["PUT"])
 def trigger_release():
@@ -83,10 +162,8 @@ def trigger_release():
     target = request.args.get("target", "")
     if not target:
         return jsonify({"error": "target required"}), 400
-
-    ok, msg = _core.trigger_release(target, bump)
-    status = 200 if ok else 409
-    return jsonify({"success": ok, "message": msg}), status
+    ok, message = _core.trigger_release(target, bump)
+    return jsonify({"success": ok, "message": message}), 200 if ok else 409
 
 
 @api.route("/promote", methods=["PUT"])
@@ -98,10 +175,8 @@ def promote():
     target = request.args.get("target", "")
     if not target:
         return jsonify({"error": "target required"}), 400
-
-    ok, msg = _core.promote_release(target)
-    status = 200 if ok else 409
-    return jsonify({"success": ok, "message": msg}), status
+    ok, message = _core.promote_release(target)
+    return jsonify({"success": ok, "message": message}), 200 if ok else 409
 
 
 @api.route("/merge", methods=["PUT"])
@@ -113,10 +188,8 @@ def merge():
     target = request.args.get("target", "")
     if not target:
         return jsonify({"error": "target required"}), 400
-
-    ok, msg = _core.merge_release(target)
-    status = 200 if ok else 409
-    return jsonify({"success": ok, "message": msg}), status
+    ok, message = _core.merge_release(target)
+    return jsonify({"success": ok, "message": message}), 200 if ok else 409
 
 
 @api.route("/set-stable", methods=["PUT"])
@@ -129,10 +202,8 @@ def set_stable():
     version = request.args.get("version", "")
     if not target or not version:
         return jsonify({"error": "target and version required"}), 400
-
-    ok, msg = _core.set_stable(target, version)
-    status = 200 if ok else 409
-    return jsonify({"success": ok, "message": msg}), status
+    ok, message = _core.set_stable(target, version)
+    return jsonify({"success": ok, "message": message}), 200 if ok else 409
 
 
 @api.route("/stop", methods=["DELETE"])
@@ -145,7 +216,5 @@ def stop():
     version = request.args.get("version", "")
     if not target or not version:
         return jsonify({"error": "target and version required"}), 400
-
-    ok, msg = _core.stop_release(target, version)
-    status = 200 if ok else 409
-    return jsonify({"success": ok, "message": msg}), status
+    ok, message = _core.stop_release(target, version)
+    return jsonify({"success": ok, "message": message}), 200 if ok else 409

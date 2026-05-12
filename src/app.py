@@ -1,8 +1,4 @@
-"""Coralforge -- release lifecycle manager.
-
-Entry point that wires configuration, core, and HTTP API together.
-Designed to replace the app_old.py monolith.
-"""
+"""Application entrypoint for the Coralforge multi-provider orchestrator."""
 
 import logging
 import os
@@ -12,11 +8,12 @@ _src_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _src_parent not in sys.path:
     sys.path.insert(0, _src_parent)
 
-from flask import Flask
+from flask import Flask, jsonify
 
 from src.api.coralforge_http import api, init_core
 from src.config.app_config import AppConfig
 from src.core.app_core import AppCore
+from src.data.brinecrypt_connector import BrinecryptConnector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +26,8 @@ def create_app() -> Flask:
     app = Flask(__name__)
 
     config = AppConfig()
-    config.load()
+    bc = BrinecryptConnector(config.brinecrypt_url)
+    config.load(bc_connector=bc)
 
     core = AppCore(config)
     core.initialize()
@@ -37,14 +35,15 @@ def create_app() -> Flask:
     init_core(core)
     app.register_blueprint(api)
 
+    @app.route("/healthz")
+    def healthz():
+        return jsonify(core.health())
+
     logger.info("Coralforge app created (%d repo(s))", len(config.repos))
     return app
-
-
-app = create_app()
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     debug = os.getenv("FLASK_DEBUG", "0") == "1"
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    create_app().run(host="0.0.0.0", port=port, debug=debug)

@@ -88,6 +88,16 @@ class BrinecryptConnector:
 
     # ── Resource CRUD ──────────────────────────────────────────────
 
+    def _extract_value(self, result: dict) -> Optional[str]:
+        """Extract the decrypted plaintext from a Brinecrypt resource response.
+
+        Brinecrypt returns value as {"data": "<plaintext>", "uuid": ..., ...}.
+        """
+        raw = result.get("value")
+        if isinstance(raw, dict):
+            return raw.get("data")
+        return raw
+
     def read_resource(self, namespace: str, name: str) -> Optional[Dict[str, Any]]:
         """Read a resource by namespace and name. Returns parsed JSON value."""
         body = {"namespace": namespace, "name": name}
@@ -95,7 +105,7 @@ class BrinecryptConnector:
         if result is None:
             return None
 
-        raw = result.get("value", "")
+        raw = self._extract_value(result)
         if isinstance(raw, str):
             try:
                 return json.loads(raw)
@@ -109,7 +119,7 @@ class BrinecryptConnector:
         result = self._post("/api/v1/resource?op=query", body)
         if result is None:
             return None
-        return result.get("value")
+        return self._extract_value(result)
 
     def write_resource(
         self, namespace: str, name: str, value: Any,

@@ -1,0 +1,23 @@
+Coralforge is a provider-agnostic CI orchestration service.
+
+It loads versioned repo-local orchestration configs, validates them against
+provider-native CI definitions, resolves credentials from Brinecrypt, and
+exposes normalized run APIs that hide GitHub Actions and Drone specifics from
+clients such as Seaglass.
+
+Primary HTTP API:
+- `GET /api/v1/repos`
+- `GET /api/v1/runs?target=<repo>&run_type=<type>&limit=<n>`
+- `POST /api/v1/runs`
+- `GET /api/v1/runs/<run_id>`
+- `GET /api/v1/runs/<run_id>/logs`
+- `GET /api/v1/runs/<run_id>/provider`
+
+Repo config discovery:
+- `CORALFORGE_REPO_CONFIGS` accepts a path-separated list or JSON array of
+  config files.
+- `CORALFORGE_REPO_ROOTS` accepts a path-separated list or JSON array of roots
+  to scan for `.coralforge.yml` or `.coralforge.yaml`.
+
+Example first-repo rollout assets for `bm25lib` live under
+`examples/bm25lib/`.

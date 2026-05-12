@@ -1,237 +1,196 @@
-"""Core orchestration layer for coralforge.
+"""Core orchestration wrapper for Coralforge."""
 
-Owns the background poll loop, the per-repo state machine instances,
-and exposes a clean API for transport layers (HTTP, gRPC, etc.) to call.
-"""
+from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.data.brinecrypt_connector import BrinecryptConnector
 from src.data.data_connector import InMemoryStateStore, PostgresStateStore, StateStore
-from src.data.github_connector import GitHubConnector
-from src.state.state import (
-    ReleaseMachine,
-)
+from src.orchestration.service import OrchestrationService
 
 logger = logging.getLogger("coralforge.core")
 
-_POLL_INTERVAL = 30  # seconds between evaluation cycles
-
 
 class AppCore:
-    """Central orchestrator for the coralforge release lifecycle.
-
-    Initializes per-repo state machines, runs a background poll loop,
-    and provides synchronous methods for the API layer.
-    """
+    """Application core that wires config, persistence, and orchestration service."""
 
     def __init__(self, config: Any):
         self.config = config
-        self._machines: Dict[str, ReleaseMachine] = {}
-        self._poll_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
         self._store: Optional[StateStore] = None
         self._bc: Optional[BrinecryptConnector] = None
+        self._service: Optional[OrchestrationService] = None
+        self._poll_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
         self._initialized = False
 
     def initialize(self) -> None:
-        """Set up all state machines and start the poll loop.
-
-        Must be called once before any API method.
-        """
         if self._initialized:
             return
 
-        # ── Brinecrypt connector ──────────────────────────────────
         self._bc = BrinecryptConnector(self.config.brinecrypt_url)
+        self.config._resolve_secrets(self._bc)
+        self.config._resolve_postgres_dsn(self._bc)
 
-        # ── State store ───────────────────────────────────────────
         if self.config.pg_dsn:
             try:
                 self._store = PostgresStateStore(self.config.pg_dsn)
                 logger.info("Using Postgres state store")
-            except Exception as e:
-                logger.warning("Postgres unavailable (%s), fallback to in-memory", e)
+            except Exception as exc:
+                logger.warning("Postgres unavailable (%s), falling back to in-memory", exc)
                 self._store = InMemoryStateStore()
         else:
             self._store = InMemoryStateStore()
-            logger.info("No Postgres DSN configured, using in-memory state store")
+            logger.info("No Postgres DSN configured; using in-memory state store")
 
-        # ── Per-repo state machines ──────────────────────────────
-        for repo_config in self.config.repos:
-            friendly = repo_config.get("friendly-name", "")
-            if not friendly:
-                continue
-
-            gh = GitHubConnector(
-                owner=repo_config.get("owner", ""),
-                repo=repo_config.get("repo", ""),
-                token=repo_config.get("token", ""),
-            )
-
-            machine = ReleaseMachine(
-                repo_name=friendly,
-                gh=gh,
-                bc=self._bc,
-                store=self._store,
-            )
-            self._machines[friendly] = machine
-            logger.info("Initialized state machine for repo '%s' (state: %s)",
-                        friendly, machine.current_state)
-
-        # ── Start background poll ─────────────────────────────────
-        self._poll_thread = threading.Thread(
-            target=self._poll_loop, daemon=True, name="core-poll",
-        )
-        self._poll_thread.start()
-        logger.info("Poll loop started (interval=%ds)", _POLL_INTERVAL)
-
+        self._service = OrchestrationService(self.config, self._store)
+        self._service.validate_repositories()
+        self._start_poll_loop()
         self._initialized = True
 
+    def _start_poll_loop(self) -> None:
+        interval = max(int(getattr(self.config, "poll_interval_seconds", 30)), 5)
+
+        def poll_loop() -> None:
+            while not self._stop_event.is_set():
+                try:
+                    if self._service is not None:
+                        self._service.refresh_active_runs()
+                except Exception as exc:
+                    logger.warning("Background refresh failed: %s", exc)
+                self._stop_event.wait(interval)
+
+        self._poll_thread = threading.Thread(target=poll_loop, daemon=True, name="coralforge-poll")
+        self._poll_thread.start()
+
     def shutdown(self) -> None:
-        """Stop the poll loop gracefully."""
         self._stop_event.set()
         if self._poll_thread and self._poll_thread.is_alive():
             self._poll_thread.join(timeout=5)
-        logger.info("Core shut down")
 
-    # ── Background poll loop ──────────────────────────────────────
-
-    def _poll_loop(self) -> None:
-        """Periodically evaluate all state machines."""
-        while not self._stop_event.is_set():
-            for name, machine in self._machines.items():
-                try:
-                    machine.evaluate()
-                except Exception as e:
-                    logger.error("[%s] Poll evaluation failed: %s", name, e)
-            self._stop_event.wait(_POLL_INTERVAL)
-
-    # ── API methods ───────────────────────────────────────────────
+    @property
+    def service(self) -> OrchestrationService:
+        if self._service is None:
+            raise RuntimeError("core not initialized")
+        return self._service
 
     def list_repos(self) -> List[str]:
-        """Return all configured repo friendly-names."""
-        return self.config.get_repo_names()
+        return self.service.list_repo_names()
 
-    def get_status(self, repo_name: Optional[str] = None
-                   ) -> List[Dict[str, Any]]:
-        """Return status for one or all repos.
+    def list_repo_definitions(self) -> List[Dict[str, Any]]:
+        return self.service.list_repos()
 
-        Returns a list of dicts, each with:
-          repo, status, version, failed, and per-repo detail.
-        """
-        if repo_name:
-            machines = {repo_name: self._machines.get(repo_name)}
-        else:
-            machines = self._machines
+    def get_status(self, repo_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        runs = self.service.list_runs(repo_name=repo_name, limit=50)
+        latest_by_repo: Dict[str, Dict[str, Any]] = {}
+        for run in runs:
+            latest_by_repo.setdefault(run["repo"], run)
 
         results = []
-        for name, machine in machines.items():
-            if machine is None:
-                continue
-            state = {
-                "repo": name,
-                "status": machine.current_state,
-                "version": machine.version,
-                "failed": machine.failed,
+        repo_names = [repo_name] if repo_name else self.service.list_repo_names()
+        for name in repo_names:
+            run = latest_by_repo.get(name)
+            results.append(
+                {
+                    "repo": name,
+                    "status": run.get("status", "unknown") if run else "unknown",
+                    "version": run.get("version") if run else None,
+                    "failed": (run.get("status") == "failed") if run else False,
+                    "current_stage": run.get("current_stage") if run else None,
+                    "provider": run.get("provider") if run else None,
+                }
+            )
+        return results
+
+    def get_stable(self, repo_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self.service.get_stable(repo_name)
+
+    def get_all_versions(self, repo_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        runs = self.service.list_runs(repo_name=repo_name, limit=200)
+        return [
+            {
+                "repo": run["repo"],
+                "version": run.get("version"),
+                "status": run.get("status"),
+                "failed": run.get("status") == "failed",
+                "stable": self._store.get_stable(run["repo"]) == run.get("version") if self._store else False,
+                "tag": run.get("version"),
+                "branch": run.get("ref"),
+                "is_current": index == 0,
+                "provider": run.get("provider"),
+                "run_type": run.get("run_type"),
             }
-            results.append(state)
+            for index, run in enumerate(runs)
+        ]
 
-        return results
+    def list_runs(
+        self,
+        repo_name: Optional[str] = None,
+        run_type: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        return self.service.list_runs(repo_name=repo_name, run_type=run_type, limit=limit)
 
-    def get_stable(self, repo_name: Optional[str] = None
-                   ) -> List[Dict[str, str]]:
-        """Return stable version for one or all repos."""
-        if repo_name:
-            repos_to_check = [repo_name]
-        else:
-            repos_to_check = self._store.list_repos() or []
+    def trigger_run(
+        self,
+        repo_name: str,
+        run_type: str,
+        ref: Optional[str] = None,
+        actor: str = "api",
+        provider_name: Optional[str] = None,
+        inputs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self.service.trigger_run(
+            repo_name=repo_name,
+            run_type=run_type,
+            ref=ref,
+            actor=actor,
+            provider_name=provider_name,
+            inputs=inputs,
+        ).to_dict()
 
-        results = []
-        for name in repos_to_check:
-            stable = self._store.get_stable(name)
-            if stable:
-                results.append({"repo": name, "stable": stable})
-            elif repo_name:
-                # If specifically asked, include even if no stable
-                results.append({"repo": name, "stable": None})
+    def get_run(self, run_id: str, refresh: bool = False) -> Optional[Dict[str, Any]]:
+        return self.service.get_run(run_id, refresh=refresh)
 
-        return results
+    def get_logs(self, run_id: str, refresh: bool = False) -> Optional[Dict[str, Any]]:
+        return self.service.get_logs(run_id, refresh=refresh)
 
-    def trigger_release(self, repo_name: str, bump: str = "patch"
-                        ) -> Tuple[bool, str]:
-        """Trigger a new release for a repo.
+    def get_provider_metadata(self, run_id: str) -> Optional[Dict[str, Any]]:
+        return self.service.get_provider_metadata(run_id)
 
-        Returns (success, message).
-        """
-        if bump not in ("patch", "minor", "major"):
-            return False, f"Invalid bump type: {bump} (use patch|minor|major)"
-
-        machine = self._machines.get(repo_name)
-        if machine is None:
-            return False, f"Unknown repo: {repo_name}"
-
-        ok = machine.trigger_release(bump)
-        if ok:
-            return True, f"Release v{machine.version} ({bump}) started"
-        return False, (f"Cannot trigger release in state "
-                       f"'{machine.current_state}'")
+    def trigger_release(self, repo_name: str, bump: str = "patch") -> Tuple[bool, str]:
+        try:
+            run = self.trigger_run(
+                repo_name=repo_name,
+                run_type="release",
+                actor="legacy-api",
+                inputs={"bump": bump},
+            )
+        except Exception as exc:
+            return False, str(exc)
+        return True, f"Release run queued ({run['run_id']})"
 
     def promote_release(self, repo_name: str) -> Tuple[bool, str]:
-        """Promote a release from e2e-test/integration-test to releasing."""
-        machine = self._machines.get(repo_name)
-        if machine is None:
-            return False, f"Unknown repo: {repo_name}"
-
-        ok = machine.promote_to_release()
-        if ok:
-            return True, f"Promoted to releasing (v{machine.version})"
-        return (False, f"Cannot promote in state "
-                f"'{machine.current_state}'")
+        run = self.service.latest_run_for_repo(repo_name, run_type="release")
+        if run is None:
+            return False, f"No release run found for '{repo_name}'"
+        return False, f"Manual promotion is not yet implemented for normalized run {run.run_id}"
 
     def merge_release(self, repo_name: str) -> Tuple[bool, str]:
-        """Merge release branch into main."""
-        machine = self._machines.get(repo_name)
-        if machine is None:
-            return False, f"Unknown repo: {repo_name}"
-
-        ok = machine.merge_and_complete()
-        if ok:
-            return True, f"Merged v{machine.version} into main"
-        return (False, f"Cannot merge in state "
-                f"'{machine.current_state}'")
+        run = self.service.latest_run_for_repo(repo_name, run_type="release")
+        if run is None:
+            return False, f"No release run found for '{repo_name}'"
+        return False, f"Merge is provider-specific and not yet implemented for normalized run {run.run_id}"
 
     def set_stable(self, repo_name: str, version: str) -> Tuple[bool, str]:
-        """Mark a version as stable."""
-        machine = self._machines.get(repo_name)
-        if machine is None:
-            return False, f"Unknown repo: {repo_name}"
-
-        ok = machine.mark_stable(version)
-        if ok:
-            return True, f"v{version} marked as stable for {repo_name}"
-        return False, f"Could not mark v{version} as stable (tag not found?)"
+        ok = self.service.mark_stable(repo_name, version)
+        return (True, f"v{version} marked as stable") if ok else (False, "could not mark stable")
 
     def stop_release(self, repo_name: str, version: str) -> Tuple[bool, str]:
-        """Stop a specific version build."""
-        machine = self._machines.get(repo_name)
-        if machine is None:
-            return False, f"Unknown repo: {repo_name}"
-
-        ok = machine.stop(version)
-        if ok:
-            return True, f"Release v{version} stopped"
-        return (False, f"Cannot stop v{version} in state "
-                f"'{machine.current_state}'")
+        return False, f"Stopping release '{repo_name}:{version}' is not yet implemented via the normalized API"
 
     def health(self) -> Dict[str, Any]:
-        """Health check — returns basic status of the core."""
-        return {
-            "status": "ok",
-            "repos": len(self._machines),
-            "bc_connected": self._bc.health() if self._bc else False,
-            "store_type": type(self._store).__name__ if self._store else "none",
-        }
+        service_health = self.service.health()
+        service_health["bc_connected"] = self._bc.health() if self._bc else False
+        return service_health

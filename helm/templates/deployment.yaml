@@ -50,6 +50,10 @@ spec:
                   key: {{ .Values.brinekey.secretKey | quote }}
             - name: GITHUB_REPO
               value: {{ required "github.repo is required" .Values.github.repo | quote }}
+            {{- if .Values.repos }}
+            - name: CORALFORGE_REPO_LIST
+              value: /etc/coralforge/repos.yml
+            {{- end }}
             {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -85,6 +89,12 @@ spec:
             - name: brinecrypt-token
               mountPath: /var/run/secrets/brinecrypt.io/serviceaccount
               readOnly: true
+            {{- if .Values.repos }}
+            - name: repo-list
+              mountPath: /etc/coralforge/repos.yml
+              subPath: repos.yml
+              readOnly: true
+            {{- end }}
       volumes:
         - name: brinecrypt-token
           projected:
@@ -93,6 +103,11 @@ spec:
                   path: token
                   expirationSeconds: 3600
                   audience: {{ .Values.brinecrypt.audience | quote }}
+        {{- if .Values.repos }}
+        - name: repo-list
+          configMap:
+            name: {{ include "coralforge.fullname" . }}-repo-list
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -1,0 +1,27 @@
+{{- if .Values.repos }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "coralforge.fullname" . }}-repo-list
+  labels:
+    {{- include "coralforge.labels" . | nindent 4 }}
+data:
+  repos.yml: |
+    repos:
+    {{- range .Values.repos }}
+      - owner: {{ .owner | quote }}
+        repo: {{ .repo | quote }}
+        {{- if .endpoint }}
+        endpoint: {{ .endpoint | quote }}
+        {{- end }}
+        {{- if .tokenSecretRef }}
+        tokenSecretRef:
+          namespace: {{ .tokenSecretRef.namespace | quote }}
+          name: {{ .tokenSecretRef.name | quote }}
+          key: {{ .tokenSecretRef.key | default "value" | quote }}
+        {{- end }}
+        {{- if .token }}
+        token: {{ .token | quote }}
+        {{- end }}
+    {{- end }}
+{{- end }}
