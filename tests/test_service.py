@@ -226,6 +226,64 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(payload["provider_run_id"], run.provider_run_id)
         self.assertEqual(payload["status"], "queued")
 
+    def test_validate_repositories_reports_missing_jenkins_stage_mapping(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            repo_dir = os.path.join(tempdir, "repo")
+            os.makedirs(repo_dir)
+            config_path = os.path.join(repo_dir, ".coralforge.yml")
+            with open(config_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    textwrap.dedent(
+                        f"""
+                        version: 1
+                        repo:
+                          name: sample-jenkins
+                          owner: acme
+                          repo: sample-jenkins
+                          workspace_path: {repo_dir}
+                        providers:
+                          jenkins:
+                            kind: jenkins
+                            endpoint: http://jenkins.example
+                            job: jackfield-pipeline
+                            simulate: true
+                        run_types:
+                          ci:
+                            default_provider: jenkins
+                            provider_target:
+                              job: jackfield-pipeline
+                            stages:
+                              - name: ci
+                                provider: jenkins
+                                target:
+                                  job: jackfield-pipeline
+                                  stage: ci
+                              - name: release
+                                provider: jenkins
+                                target:
+                                  job: jackfield-pipeline
+                                  stage: release
+                        """
+                    ).strip()
+                )
+            config = AppConfig()
+            config.load(repo_config_paths=[config_path])
+            repo = config.get_repo("sample-jenkins")
+            self.assertIsNotNone(repo)
+
+            service = OrchestrationService(config, InMemoryStateStore())
+
+            class FakeJenkinsConnector:
+                def discover_definitions(self, _repo):
+                    return {"jackfield-pipeline": {"stages": ["ci"]}}
+
+            service._connectors[(repo.name, "jenkins")] = FakeJenkinsConnector()
+            service.validate_repositories()
+
+            self.assertTrue(
+                any("missing Jenkins stage 'release'" in error for error in repo.validation_errors)
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

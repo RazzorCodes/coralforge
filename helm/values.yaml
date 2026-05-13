@@ -95,4 +95,4 @@ serviceAccount:
   create: true
   name: ""
   annotations:
-    brinecrypt.io/access: "ci:read,write,coralforge:read,write,github:read,drone:read"
+    brinecrypt.io/access: "ci:read,write,coralforge:read,write,github:read,drone:read,jenkins:read,write"

@@ -168,6 +168,45 @@ class OrchestrationService:
                         repo.validation_errors.append(
                             f"stage '{run_name}:{stage.name}' references missing Drone step '{step_name}'"
                         )
+        elif provider_kind == "jenkins":
+            job = run_definition.provider_target.get("job")
+            if job and job not in discovered:
+                repo.validation_errors.append(
+                    f"run type '{run_name}' references missing Jenkins job '{job}'"
+                )
+            for stage in run_definition.stages:
+                if stage.provider not in repo.providers:
+                    continue
+                if repo.providers[stage.provider].kind != "jenkins":
+                    continue
+                stage_job = stage.target.get("job") or run_definition.provider_target.get("job")
+                if stage_job and stage_job not in discovered:
+                    repo.validation_errors.append(
+                        f"stage '{run_name}:{stage.name}' references missing Jenkins job '{stage_job}'"
+                    )
+                    continue
+                stage_name = stage.target.get("stage")
+                discovered_stages = discovered.get(stage_job, {}).get("stages") or []
+                if stage_name and discovered_stages and stage_name not in discovered_stages:
+                    repo.validation_errors.append(
+                        f"stage '{run_name}:{stage.name}' references missing Jenkins stage '{stage_name}'"
+                    )
+
+    @staticmethod
+    def _definition_target_name(run_definition: RunDefinition) -> Optional[str]:
+        return (
+            run_definition.provider_target.get("pipeline")
+            or run_definition.provider_target.get("workflow")
+            or run_definition.provider_target.get("job")
+        )
+
+    @staticmethod
+    def _snapshot_target_name(snapshot: ProviderRunSnapshot) -> Optional[str]:
+        return (
+            snapshot.metadata.get("pipeline")
+            or snapshot.metadata.get("workflow")
+            or snapshot.metadata.get("job")
+        )
 
     def list_repo_names(self) -> List[str]:
         return self.config.get_repo_names()
@@ -349,10 +388,10 @@ class OrchestrationService:
             return -1
 
         score = 0
-        target_pipeline = run_definition.provider_target.get("pipeline")
-        snapshot_pipeline = snapshot.metadata.get("pipeline")
-        if target_pipeline and snapshot_pipeline:
-            if target_pipeline != snapshot_pipeline:
+        target_name = self._definition_target_name(run_definition)
+        snapshot_name = self._snapshot_target_name(snapshot)
+        if target_name and snapshot_name:
+            if target_name != snapshot_name:
                 return -1
             score += 10
 
@@ -432,10 +471,13 @@ class OrchestrationService:
                 provider_name,
                 snapshot,
             )
-            normalized_snapshot.metadata.setdefault(
-                "pipeline",
-                run_definition.provider_target.get("pipeline"),
-            )
+            target_name = self._definition_target_name(run_definition)
+            if run_definition.provider_target.get("pipeline"):
+                normalized_snapshot.metadata.setdefault("pipeline", target_name)
+            elif run_definition.provider_target.get("workflow"):
+                normalized_snapshot.metadata.setdefault("workflow", target_name)
+            elif run_definition.provider_target.get("job"):
+                normalized_snapshot.metadata.setdefault("job", target_name)
             normalized_stages = normalized_snapshot.stages or self._initial_stages(run_definition)
 
             run = CiRun(
@@ -644,15 +686,37 @@ class OrchestrationService:
 
     def refresh_run(self, run: CiRun) -> CiRun:
         repo = self.config.get_repo(run.repo)
-        if repo is None or not run.provider_run_id:
+        if repo is None:
             return run
+        if not run.provider_run_id:
+            tag = run.provider_metadata.get("tag")
+            if tag and run.status in ACTIVE_RUN_STATUSES:
+                connector = self._connector_for(repo, run.provider)
+                try:
+                    build_id = connector.find_build_by_ref(repo, tag)
+                except Exception as exc:
+                    logger.warning("find_build_by_ref failed for run %s tag %s: %s", run.run_id, tag, exc)
+                    build_id = None
+                if build_id:
+                    run.provider_run_id = build_id
+                    logger.info("Linked run %s to provider build %s via tag %s", run.run_id, build_id, tag)
+                else:
+                    return run
+            else:
+                return run
 
         connector = self._connector_for(repo, run.provider)
         snapshot = connector.get_run(repo, run.provider_run_id)
         run_definition = repo.run_types.get(run.run_type)
         if run_definition is not None:
             snapshot = self._normalize_snapshot_for_run_definition(run_definition, run.provider, snapshot)
-            snapshot.metadata.setdefault("pipeline", run_definition.provider_target.get("pipeline"))
+            target_name = self._definition_target_name(run_definition)
+            if run_definition.provider_target.get("pipeline"):
+                snapshot.metadata.setdefault("pipeline", target_name)
+            elif run_definition.provider_target.get("workflow"):
+                snapshot.metadata.setdefault("workflow", target_name)
+            elif run_definition.provider_target.get("job"):
+                snapshot.metadata.setdefault("job", target_name)
         run.status = snapshot.status
         run.provider_status = snapshot.provider_status
         run.provider_url = snapshot.url or run.provider_url

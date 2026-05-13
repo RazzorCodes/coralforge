@@ -6,9 +6,11 @@ from datetime import datetime, timezone
 import io
 import logging
 import os
+import re
 import zipfile
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import requests
 import yaml
@@ -214,6 +216,10 @@ class CiProviderConnector(ABC):
 
     def list_recent_runs(self, repo: RepoDefinition, limit: int = 20) -> List[ProviderRunSnapshot]:
         return []
+
+    def find_build_by_ref(self, repo: RepoDefinition, ref: str) -> Optional[str]:
+        """Return a provider_run_id for a build triggered by the given ref (e.g. a tag name), or None."""
+        return None
 
 
 class ReleaseProviderConnector(CiProviderConnector):
@@ -461,18 +467,8 @@ class GitHubActionsConnector(CiProviderConnector):
 
         if workflow_def.get("tag_patterns"):
             return self._trigger_via_tag(workflow, workflow_def, ref_name, inputs or {})
-
-        response = self.session.post(
-            f"{self.base_url}/actions/workflows/{workflow}/dispatches",
-            json={"ref": ref_name, "inputs": inputs or {}},
-            timeout=15,
-        )
-        response.raise_for_status()
-        return ProviderRunSnapshot(
-            status="queued",
-            provider_status="dispatched",
-            ref=ref_name,
-            metadata={"workflow": workflow, "inputs": inputs or {}},
+        raise ValueError(
+            f"workflow '{workflow}' is not tag-triggerable; configure 'on.push.tags' in the workflow so Coralforge can trigger via Git tag"
         )
 
     def get_run(self, repo: RepoDefinition, provider_run_id: str) -> ProviderRunSnapshot:
@@ -559,6 +555,49 @@ class GitHubActionsConnector(CiProviderConnector):
             )
             for index, job in enumerate(jobs)
         }
+
+    def list_recent_runs(self, repo: RepoDefinition, limit: int = 20) -> List[ProviderRunSnapshot]:
+        try:
+            response = self.session.get(
+                f"{self.base_url}/actions/runs",
+                params={"per_page": min(limit, 100)},
+                timeout=15,
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("GHA list runs failed for %s: %s", repo.name, exc)
+            return []
+
+        snapshots: List[ProviderRunSnapshot] = []
+        for run in response.json().get("workflow_runs", []):
+            provider_run_id = str(run.get("id", "")).strip()
+            if not provider_run_id:
+                continue
+            workflow_path = run.get("path", "")
+            workflow_file = workflow_path.split("/")[-1] if workflow_path else str(run.get("workflow_id", ""))
+            status = run.get("status", "")
+            conclusion = run.get("conclusion")
+            finished_at = run.get("updated_at") if status == "completed" else None
+            snapshots.append(
+                ProviderRunSnapshot(
+                    status=self._normalize_status(status, conclusion),
+                    provider_status=conclusion or status or "unknown",
+                    provider_run_id=provider_run_id,
+                    url=run.get("html_url"),
+                    sha=run.get("head_sha"),
+                    ref=run.get("head_branch"),
+                    created_at=run.get("created_at"),
+                    started_at=run.get("run_started_at"),
+                    finished_at=finished_at,
+                    metadata={
+                        "event": run.get("event"),
+                        "workflow": workflow_file,
+                        "workflow_id": run.get("workflow_id"),
+                        "run_number": run.get("run_number"),
+                    },
+                )
+            )
+        return snapshots
 
 
 class DroneConnector(CiProviderConnector):
@@ -709,16 +748,18 @@ class DroneConnector(CiProviderConnector):
         pipeline_def: Dict[str, Any],
         ref_name: str,
         inputs: Dict[str, Any],
+        tag_prefix_override: Optional[str] = None,
     ) -> ProviderRunSnapshot:
         trigger = pipeline_def.get("trigger") or {}
         ref_block = trigger.get("ref") or {}
         ref_includes = ref_block.get("include", []) if isinstance(ref_block, dict) else []
 
-        tag_prefix: Optional[str] = None
-        for pattern in ref_includes:
-            if isinstance(pattern, str) and pattern.startswith("refs/tags/") and pattern.endswith("*"):
-                tag_prefix = pattern[len("refs/tags/"):-1]
-                break
+        tag_prefix: Optional[str] = tag_prefix_override
+        if not tag_prefix:
+            for pattern in ref_includes:
+                if isinstance(pattern, str) and pattern.startswith("refs/tags/") and pattern.endswith("*"):
+                    tag_prefix = pattern[len("refs/tags/"):-1]
+                    break
 
         if not tag_prefix:
             raise ValueError(f"Cannot determine tag prefix for pipeline '{pipeline}'")
@@ -816,6 +857,34 @@ class DroneConnector(CiProviderConnector):
                 return item
         return matched[0] if matched else None
 
+    def find_build_by_ref(self, repo: RepoDefinition, ref: str) -> Optional[str]:
+        if self.binding.config.get("simulate") or not self.endpoint:
+            return None
+        owner = self.binding.config.get("owner", repo.owner)
+        repo_name = self.binding.config.get("repo", repo.repo)
+        try:
+            response = self.session.get(
+                f"{self.endpoint}/api/repos/{owner}/{repo_name}/builds",
+                params={"page": 1, "per_page": 25},
+                timeout=15,
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("find_build_by_ref failed for tag %s: %s", ref, exc)
+            return None
+        payload = response.json()
+        if not isinstance(payload, list):
+            return None
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            target = item.get("target", "")
+            if target in {ref, f"refs/tags/{ref}"}:
+                number = item.get("number")
+                if number is not None:
+                    return str(number)
+        return None
+
     def trigger_run(
         self,
         repo: RepoDefinition,
@@ -840,7 +909,7 @@ class DroneConnector(CiProviderConnector):
         owner = self.binding.config.get("owner", repo.owner)
         repo_name = self.binding.config.get("repo", repo.repo)
 
-        # Route to GitHub tag creation for pipelines that trigger on tag events
+        # Create GitHub tag and trigger Drone directly for tag-ref pipelines
         definitions = self.discover_definitions(repo)
         pipeline_def = definitions.get(pipeline, {})
         trigger = pipeline_def.get("trigger") or {}
@@ -850,11 +919,45 @@ class DroneConnector(CiProviderConnector):
             else event_block if isinstance(event_block, list)
             else []
         )
-        if "tag" in trigger_events:
+        ref_block = trigger.get("ref") or {}
+        ref_includes = ref_block.get("include", []) if isinstance(ref_block, dict) else []
+        has_tag_ref = (
+            "tag" in trigger_events
+            or any(isinstance(p, str) and "refs/tags/" in p for p in ref_includes)
+            or bool(run_definition.provider_target.get("tag_prefix"))
+        )
+        if has_tag_ref:
             sess = self._github_session()
             if not sess:
-                raise ValueError(f"github_token required to trigger tag-based pipeline '{pipeline}'")
-            return self._trigger_via_tag(sess, owner, repo_name, pipeline, pipeline_def, ref_name, inputs or {})
+                raise ValueError(f"github_token required to create tag for pipeline '{pipeline}'")
+            tag_prefix_override = run_definition.provider_target.get("tag_prefix") or None
+            tag_snapshot = self._trigger_via_tag(sess, owner, repo_name, pipeline, pipeline_def, ref_name, inputs or {}, tag_prefix_override)
+            tag_name = tag_snapshot.metadata.get("tag")
+            if tag_name:
+                drone_ref = f"refs/tags/{tag_name}"
+                response = self.session.post(
+                    f"{self.endpoint}/api/repos/{owner}/{repo_name}/builds",
+                    params={"branch": drone_ref},
+                    timeout=15,
+                )
+                response.raise_for_status()
+                payload: Optional[Dict[str, Any]]
+                try:
+                    payload = self._coerce_build_payload(response.json())
+                except ValueError:
+                    payload = None
+                if payload is None:
+                    payload = self._find_recent_triggered_build(owner, repo_name, drone_ref)
+                if payload is not None:
+                    tag_snapshot.provider_run_id = str(payload.get("number", ""))
+                    tag_snapshot.status = self._normalize_status(payload.get("status", ""))
+                    tag_snapshot.provider_status = payload.get("status", tag_snapshot.provider_status)
+                    tag_snapshot.url = payload.get("link") or tag_snapshot.url
+                    tag_snapshot.created_at = _normalize_provider_timestamp(payload.get("created"))
+                    tag_snapshot.started_at = _normalize_provider_timestamp(payload.get("started"))
+                else:
+                    logger.warning("No Drone build found after tag creation for pipeline '%s'", pipeline)
+            return tag_snapshot
 
         response = self.session.post(
             f"{self.endpoint}/api/repos/{owner}/{repo_name}/builds",
@@ -1019,9 +1122,396 @@ class DroneConnector(CiProviderConnector):
         return logs
 
 
+class JenkinsConnector(CiProviderConnector):
+    def __init__(self, binding: ProviderBinding):
+        super().__init__(binding)
+        self.endpoint = str(binding.config.get("endpoint", "")).rstrip("/")
+        self.default_job = str(binding.config.get("job", "")).strip()
+        self._crumb_header: Dict[str, str] = {}
+        self.session = requests.Session()
+        user = str(binding.config.get("user", "")).strip()
+        token = str(binding.config.get("token", "")).strip()
+        if user and token:
+            self.session.auth = (user, token)
+        if not self.binding.config.get("simulate") and not self.endpoint:
+            raise ValueError("jenkins provider requires endpoint or simulate=true")
+
+    @staticmethod
+    def _normalize_status(result: Optional[str], building: bool = False, blocked: bool = False) -> str:
+        if blocked:
+            return "blocked"
+        if building:
+            return "running"
+        if result in {None, "", "NOT_BUILT"}:
+            return "queued"
+        result = str(result).upper()
+        if result == "SUCCESS":
+            return "passed"
+        if result in {"FAILURE", "UNSTABLE"}:
+            return "failed"
+        if result in {"ABORTED", "CANCELLED"}:
+            return "cancelled"
+        return "unknown"
+
+    @staticmethod
+    def _job_path(job: str) -> str:
+        parts = [part for part in str(job).split("/") if part]
+        return "".join(f"/job/{quote(part, safe='')}" for part in parts)
+
+    def _job_api_url(self, job: str, suffix: str = "") -> str:
+        return f"{self.endpoint}{self._job_path(job)}{suffix}"
+
+    def _ensure_crumb(self) -> None:
+        if self._crumb_header:
+            return
+        try:
+            response = self.session.get(f"{self.endpoint}/crumbIssuer/api/json", timeout=15)
+        except Exception:
+            return
+        if not response.ok:
+            return
+        payload = response.json() or {}
+        crumb_field = payload.get("crumbRequestField")
+        crumb_value = payload.get("crumb")
+        if crumb_field and crumb_value:
+            self._crumb_header = {str(crumb_field): str(crumb_value)}
+
+    @staticmethod
+    def _extract_parameters(actions: Any) -> Dict[str, Any]:
+        params: Dict[str, Any] = {}
+        if not isinstance(actions, list):
+            return params
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            for item in action.get("parameters") or []:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                if name:
+                    params[str(name)] = item.get("value")
+        return params
+
+    @staticmethod
+    def _extract_sha(actions: Any) -> Optional[str]:
+        if not isinstance(actions, list):
+            return None
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            builds = action.get("buildsByBranchName")
+            if isinstance(builds, dict):
+                for entry in builds.values():
+                    if isinstance(entry, dict):
+                        sha = entry.get("revision", {}).get("SHA1")
+                        if sha:
+                            return str(sha)
+        return None
+
+    def _resolve_job(self, run_definition: RunDefinition, stage_target: Optional[Dict[str, Any]] = None) -> str:
+        if stage_target and stage_target.get("job"):
+            return str(stage_target["job"]).strip()
+        if run_definition.provider_target.get("job"):
+            return str(run_definition.provider_target["job"]).strip()
+        if self.default_job:
+            return self.default_job
+        raise ValueError(f"run type '{run_definition.name}' missing provider_target.job")
+
+    @staticmethod
+    def _resolve_version(run_type: str, ref_name: str, inputs: Dict[str, Any]) -> Optional[str]:
+        explicit = str(inputs.get("version", "") or "").strip()
+        if explicit:
+            return explicit
+        if run_type == "release":
+            match = re.match(r"^release-(\d+\.\d+\.\d+)$", ref_name)
+            if match:
+                return match.group(1)
+        if run_type == "stable":
+            match = re.match(r"^stable-(\d+\.\d+\.\d+)$", ref_name)
+            if match:
+                return match.group(1)
+        return None
+
+    def _queue_snapshot(self, job: str, queue_id: str, ref_name: str, parameters: Dict[str, Any]) -> ProviderRunSnapshot:
+        return ProviderRunSnapshot(
+            status="queued",
+            provider_status="queued",
+            provider_run_id=f"queue:{queue_id}",
+            ref=ref_name,
+            metadata={
+                "job": job,
+                "queue_item": queue_id,
+                "parameters": parameters,
+            },
+        )
+
+    def _resolve_build_from_queue(self, job: str, queue_id: str) -> Optional[str]:
+        response = self.session.get(
+            f"{self.endpoint}/queue/item/{quote(queue_id, safe='')}/api/json",
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json() or {}
+        executable = payload.get("executable") or {}
+        number = executable.get("number")
+        if number is None:
+            return None
+        return str(number)
+
+    def _wfapi_stages(self, job: str, build_id: str) -> List[CiStage]:
+        response = self.session.get(
+            self._job_api_url(job, f"/{quote(str(build_id), safe='')}/wfapi/describe"),
+            timeout=15,
+        )
+        if not response.ok:
+            return []
+        payload = response.json() or {}
+        stages: List[CiStage] = []
+        for stage in payload.get("stages") or []:
+            if not isinstance(stage, dict):
+                continue
+            status = self._normalize_status(stage.get("status"), stage.get("status") == "IN_PROGRESS")
+            stage_id = stage.get("id")
+            metadata: Dict[str, Any] = {}
+            if stage_id is not None:
+                metadata["id"] = stage_id
+            stages.append(
+                CiStage(
+                    name=str(stage.get("name", "")),
+                    provider=self.binding.name,
+                    status=status,
+                    started_at=_normalize_provider_timestamp(stage.get("startTimeMillis")),
+                    finished_at=_normalize_provider_timestamp(stage.get("endTimeMillis")),
+                    duration_seconds=((stage.get("durationMillis") or 0) / 1000.0) if stage.get("durationMillis") else None,
+                    metadata=metadata,
+                )
+            )
+        return stages
+
+    def discover_definitions(self, repo: RepoDefinition) -> Dict[str, Dict[str, Any]]:
+        job = self.default_job
+        if self.binding.config.get("simulate"):
+            if not job:
+                return {}
+            return {job: {"name": job, "job": job, "stages": []}}
+        if not job:
+            return {}
+
+        response = self.session.get(
+            self._job_api_url(job, "/api/json"),
+            params={"tree": "name,fullName,url,buildable,lastBuild[number]"},
+            timeout=15,
+        )
+        if not response.ok:
+            logger.warning("Jenkins job discovery failed for %s: %s", job, response.status_code)
+            return {}
+        payload = response.json() or {}
+        last_build = (payload.get("lastBuild") or {}).get("number")
+        stage_names: List[str] = []
+        if last_build is not None:
+            stage_names = [stage.name for stage in self._wfapi_stages(job, str(last_build))]
+        return {
+            job: {
+                "name": payload.get("name", job),
+                "job": payload.get("fullName", job),
+                "url": payload.get("url"),
+                "buildable": bool(payload.get("buildable", True)),
+                "stages": stage_names,
+            }
+        }
+
+    def trigger_run(
+        self,
+        repo: RepoDefinition,
+        run_definition: RunDefinition,
+        ref: Optional[str],
+        inputs: Optional[Dict[str, Any]] = None,
+    ) -> ProviderRunSnapshot:
+        ref_name = ref or repo.metadata.get("default_ref", "main")
+        data = dict(inputs or {})
+        run_type = str(data.get("run_type", run_definition.name))
+        job = self._resolve_job(run_definition)
+        version = self._resolve_version(run_type, ref_name, data)
+        parameters: Dict[str, Any] = {
+            "RUN_TYPE": run_type,
+            "REF_NAME": ref_name,
+            "BUMP": str(data.get("bump", "patch")),
+            "ACTOR": str(data.get("actor", "coralforge")),
+            "DRY_RUN": str(data.get("dry_run", True)).lower(),
+        }
+        if version:
+            parameters["VERSION"] = version
+            parameters["version"] = version
+
+        if self.binding.config.get("simulate"):
+            return ProviderRunSnapshot(
+                status="queued",
+                provider_status="simulated",
+                provider_run_id=f"sim-{run_type}-{job}-{ref_name}",
+                ref=ref_name,
+                metadata={"job": job, "simulated": True, "parameters": parameters},
+            )
+
+        self._ensure_crumb()
+        response = self.session.post(
+            self._job_api_url(job, "/buildWithParameters"),
+            params=parameters,
+            headers=self._crumb_header,
+            timeout=15,
+        )
+        response.raise_for_status()
+        location = (response.headers or {}).get("Location", "")
+        queue_id = location.rstrip("/").split("/")[-1] if location else "unknown"
+        return self._queue_snapshot(job, queue_id, ref_name, parameters)
+
+    def get_run(self, repo: RepoDefinition, provider_run_id: str) -> ProviderRunSnapshot:
+        run_definition = repo.run_types.get("ci")
+        if provider_run_id.startswith("sim-"):
+            return ProviderRunSnapshot(
+                status="passed",
+                provider_status="SUCCESS",
+                provider_run_id=provider_run_id,
+                ref=repo.metadata.get("default_ref", "main"),
+                metadata={"simulated": True},
+            )
+        if run_definition is None:
+            run_definition = next(iter(repo.run_types.values()), RunDefinition(name="ci", default_provider=self.binding.name))
+        job = self._resolve_job(run_definition)
+
+        build_id = provider_run_id
+        if provider_run_id.startswith("queue:"):
+            queue_id = provider_run_id.split(":", 1)[1]
+            resolved = self._resolve_build_from_queue(job, queue_id)
+            if resolved is None:
+                return ProviderRunSnapshot(
+                    status="queued",
+                    provider_status="queued",
+                    provider_run_id=provider_run_id,
+                    metadata={"job": job, "queue_item": queue_id},
+                )
+            build_id = resolved
+
+        response = self.session.get(
+            self._job_api_url(
+                job,
+                f"/{quote(str(build_id), safe='')}/api/json",
+            ),
+            params={"tree": "id,number,url,result,building,timestamp,duration,actions[parameters[name,value],buildsByBranchName[*]]"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json() or {}
+        actions = payload.get("actions") or []
+        params = self._extract_parameters(actions)
+        ref_name = str(params.get("REF_NAME") or params.get("BRANCH_NAME") or "")
+        created_at = _normalize_provider_timestamp(payload.get("timestamp"))
+        finished_at = _normalize_provider_timestamp((payload.get("timestamp") or 0) + (payload.get("duration") or 0))
+        stages = self._wfapi_stages(job, str(payload.get("number", build_id)))
+        provider_status = payload.get("result") or ("RUNNING" if payload.get("building") else "QUEUED")
+        normalized_status = self._normalize_status(payload.get("result"), bool(payload.get("building")))
+        metadata: Dict[str, Any] = {
+            "job": job,
+            "build_number": payload.get("number"),
+            "run_type": params.get("RUN_TYPE"),
+            "version": params.get("VERSION") or params.get("version"),
+            "parameters": params,
+        }
+        return ProviderRunSnapshot(
+            status=normalized_status,
+            provider_status=str(provider_status),
+            provider_run_id=str(payload.get("number", build_id)),
+            url=payload.get("url"),
+            created_at=created_at,
+            started_at=created_at,
+            finished_at=finished_at if normalized_status not in {"queued", "running"} else None,
+            sha=self._extract_sha(actions),
+            ref=ref_name or None,
+            stages=stages,
+            metadata=metadata,
+        )
+
+    def list_recent_runs(self, repo: RepoDefinition, limit: int = 20) -> List[ProviderRunSnapshot]:
+        if self.binding.config.get("simulate"):
+            return []
+        run_definition = next(iter(repo.run_types.values()), RunDefinition(name="ci", default_provider=self.binding.name))
+        job = self._resolve_job(run_definition)
+        response = self.session.get(
+            self._job_api_url(job, "/api/json"),
+            params={"tree": f"builds[number,result,building,url,timestamp,duration]{{0,{limit}}}"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json() or {}
+        snapshots: List[ProviderRunSnapshot] = []
+        for item in payload.get("builds") or []:
+            if not isinstance(item, dict):
+                continue
+            number = item.get("number")
+            if number is None:
+                continue
+            status = self._normalize_status(item.get("result"), bool(item.get("building")))
+            snapshots.append(
+                ProviderRunSnapshot(
+                    status=status,
+                    provider_status=str(item.get("result") or ("RUNNING" if item.get("building") else "QUEUED")),
+                    provider_run_id=str(number),
+                    url=item.get("url"),
+                    created_at=_normalize_provider_timestamp(item.get("timestamp")),
+                    started_at=_normalize_provider_timestamp(item.get("timestamp")),
+                    finished_at=_normalize_provider_timestamp((item.get("timestamp") or 0) + (item.get("duration") or 0)),
+                    metadata={"job": job, "build_number": number},
+                )
+            )
+        return snapshots
+
+    def find_build_by_ref(self, repo: RepoDefinition, ref: str) -> Optional[str]:
+        if self.binding.config.get("simulate"):
+            return None
+        run_definition = next(iter(repo.run_types.values()), RunDefinition(name="ci", default_provider=self.binding.name))
+        job = self._resolve_job(run_definition)
+        response = self.session.get(
+            self._job_api_url(job, "/api/json"),
+            params={"tree": "builds[number]"},
+            timeout=15,
+        )
+        if not response.ok:
+            return None
+        payload = response.json() or {}
+        for item in payload.get("builds") or []:
+            if not isinstance(item, dict):
+                continue
+            build_number = item.get("number")
+            if build_number is None:
+                continue
+            try:
+                snapshot = self.get_run(repo, str(build_number))
+            except Exception:
+                continue
+            params = snapshot.metadata.get("parameters") or {}
+            if str(params.get("REF_NAME", "")) == ref:
+                return str(build_number)
+        return None
+
+    def get_logs(self, repo: RepoDefinition, provider_run_id: str) -> Dict[str, str]:
+        if provider_run_id.startswith("sim-"):
+            return {"simulated": "Simulated Jenkins run; no remote logs were fetched."}
+        run_definition = next(iter(repo.run_types.values()), RunDefinition(name="ci", default_provider=self.binding.name))
+        job = self._resolve_job(run_definition)
+        if provider_run_id.startswith("queue:"):
+            return {"queue": "Build is still queued; logs are not available yet."}
+        response = self.session.get(
+            self._job_api_url(job, f"/{quote(str(provider_run_id), safe='')}/consoleText"),
+            timeout=30,
+        )
+        response.raise_for_status()
+        return {"console": response.text}
+
+
 def build_ci_connector(binding: ProviderBinding) -> CiProviderConnector:
     if binding.kind == "github-actions":
         return GitHubActionsConnector(binding)
     if binding.kind == "drone":
         return DroneConnector(binding)
+    if binding.kind == "jenkins":
+        return JenkinsConnector(binding)
     raise ValueError(f"unsupported CI provider kind: {binding.kind}")

@@ -4,6 +4,8 @@ It loads versioned repo-local orchestration configs, validates them against
 provider-native CI definitions, resolves credentials from Brinecrypt, and
 exposes normalized run APIs that hide GitHub Actions and Drone specifics from
 clients such as Seaglass.
+clients such as Seaglass. Supported CI providers are GitHub Actions, Drone,
+and Jenkins.
 
 Primary HTTP API:
 - `GET /api/v1/repos`
